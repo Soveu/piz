@@ -3,119 +3,79 @@
 #![feature(array_windows)]
 
 use core::mem;
-use core::ops::Range;
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct LocalFileHeader {
-    pub signature: u32, // 0x04034b50
-    pub version_min: u16,
-    pub flags: u16,
-    pub compression_method: u16,
-    pub last_mod_time: u16,
-    pub last_mod_date: u16,
-    pub uncompressed_crc: u32,
-    pub compressed_size: u32,
-    pub uncompressed_size: u32,
-    pub filename_len: u16,
-    pub extra_field_len: u16,
-}
+pub mod raw;
+pub mod extra;
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct CentralDirectoryFileHeader {
-    pub signature: u32, // 0x02014b50
-    pub version_made_by: u16,
-    pub version_min: u16,
-    pub flags: u16,
-    pub compression_method: u16,
-    pub last_mod_time: u16,
-    pub last_mod_date: u16,
-    pub uncompressed_crc: u32,
-    pub compressed_size: u32,
-    pub uncompressed_size: u32,
-    pub filename_len: u16,
-    pub extra_field_len: u16,
-    pub file_comment_len: u16,
-    pub disk_number: u16,
-    pub file_attr_internal: u16,
-    pub file_attr_external: u32,
-    pub local_file_header_offset: u32,
-}
+use crate::extra::Extra;
 
-/// The actual ZIP "header"
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct EndOfCentralDirectoryRecord {
-    pub signature: u32, // 0x06054b50
-    pub disk_num: u16,
-    pub central_dir_start_disk: u16,
-    pub central_dir_records_on_this_disk: u16,
-    pub central_dir_records_total: u16,
-    pub central_dir_size: u32,
-    pub central_dir_offset: u32,
-    pub comment_length: u16,
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct Zip64Extra {
-    pub header: u16, // 0x0001
-    pub extra_field_size: u16,
-    pub uncompressed_filesize: u64,
-    pub compressed_data_size: u64,
-    pub local_header_record_offset: u64,
-    pub disk_no: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct Zip64EndOfCentralDirectoryRecord {
-    pub signature: u32, // 0x06064b50
-    pub self_size: u64,
-    pub version_made_by: u16,
-    pub version_min: u16,
-    pub disk_num: u32,
-    pub central_dir_start_disk: u32,
-    pub central_dir_records_on_this_disk: u64,
+pub struct Zip<'data> {
+    pub central_dir_iter: NonStrictIter<'data>,
     pub central_dir_records_total: u64,
-    pub central_directory_size: u64,
-    pub central_dir_offset: u64,
 }
 
-pub const CENTRAL_DIR_END_SIGNATURE: u32 = 0x06054b50;
-pub const CENTRAL_DIR_END_SIGNATURE_ZIP64: u32 = 0x06064b50;
-pub const CENTRAL_DIR_HEADER_SIGNATURE: u32 = 0x02014b50;
+impl<'data> Zip<'data> {
+    pub fn new(data: &'data [u8]) -> Option<Self> {
+        let (header, _comment_len) = raw::CentralDirectoryRecordEnd::find(data)?;
 
-impl EndOfCentralDirectoryRecord {
-    const SELF_SIZE: usize = mem::size_of::<Self>();
+        // TODO: zip64
+        let central_dir_records_total = header.central_dir_records_total as u64;
+        let central_dir_iter = NonStrictIter {
+            data,
+            offset: header.central_dir_offset as usize,
+        };
 
-    /// Finds ZIP "header" with a little twist.
-    /// Because it is possible to embed a valid zip header inside zip header comment,
-    /// this tries to find the topmost header.
-    pub fn find(bytes: &[u8]) -> Option<&Self> {
-        let start_offset = bytes.len().saturating_sub(u16::MAX as usize);
-        let bytes = &bytes[start_offset..];
-
-        /* SAFETY: Self is so-called "Plain Ol' Data", so we can cast from bytes
-         * to an actual struct pointer.
-         * `array_windows` cares about having enough bytes. */
-        bytes
-            .array_windows::<{Self::SELF_SIZE}>()
-            .rev()
-            .map(|window| unsafe { &*(window as *const _ as *const Self) })
-            .enumerate()
-            .filter(|&(_i, maybe_header)| maybe_header.signature == CENTRAL_DIR_END_SIGNATURE)
-            .filter(|&(i, maybe_header)| maybe_header.comment_length as usize == i)
-            .last()
-            .map(|(_i, maybe_header)| maybe_header)
+        Some(Self {
+            central_dir_records_total,
+            central_dir_iter,
+        })
     }
+}
 
-    pub fn central_dir_range(&self) -> Range<usize> {
-        let offset = self.central_dir_offset as usize;
-        let size = self.central_dir_size as usize;
-        offset .. offset+size
+#[derive(Clone, Copy, Debug)]
+pub enum CompressionMethod {
+    Plain = 0,
+
+    Deflate = 8,
+    Deflate64 = 9,
+    IbmTerseOld = 10,
+    Bzip2 = 12,
+    Lzma = 14,
+    IbmCmpsc = 16,
+    IbmTerseNew = 18,
+    IbmLz77 = 19,
+
+    Zstd = 93,
+    Mp3 = 94,
+    Xz = 95,
+    Jpeg = 96,
+    WavPack = 97,
+    Ppmd1 = 98,
+}
+
+impl CompressionMethod {
+    pub const fn from_u16(x: u16) -> Option<Self> {
+        let ret = match x {
+            0 => Self::Plain,
+            8 => Self::Deflate,
+            _ => return None,
+        };
+        return Some(ret);
     }
+}
+
+#[derive(Debug)]
+pub struct ExtraFields;
+
+#[derive(Debug)]
+pub struct File<'data> {
+    pub decompressed_crc: u32,
+    pub decompressed_size: usize,
+    pub compression_method: CompressionMethod,
+    pub extra_fields: &'data [u8],
+    pub filename: &'data [u8],
+    pub comment: &'data [u8],
+    pub bytes: &'data [u8],
 }
 
 fn slice_split_at<T>(s: &[T], index: usize) -> Option<(&[T], &[T])> {
@@ -140,36 +100,80 @@ fn slice_split_at<T>(s: &[T], index: usize) -> Option<(&[T], &[T])> {
  * - signature doesn't match
  * - directory has too much / too little records 
  * - some other weird stuff */
-pub struct CentralDirIter<'a> {
-    /// Place in memory, where directories are contiguously allocated
+pub struct NonStrictIter<'a> {
     pub data: &'a [u8],
+    pub offset: usize,
 
     //pub _remaining_items: usize,
 }
 
-impl<'a> Iterator for CentralDirIter<'a> {
-    type Item = (&'a CentralDirectoryFileHeader, &'a [u8]);
+impl<'a> Iterator for NonStrictIter<'a> {
+    type Item = File<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        const CENTRAL_DIR_HEADER_SIZE: usize = mem::size_of::<CentralDirectoryFileHeader>();
+        const CENTRAL_DIR_HEADER_SIZE: usize = mem::size_of::<raw::CentralDirectoryFileHeader>();
 
-        let (central_dir, bytes) = slice_split_at(self.data, CENTRAL_DIR_HEADER_SIZE)?;
-        let central_dir = central_dir.as_ptr() as *const CentralDirectoryFileHeader;
+        let bytes = self.data.get(self.offset..)?;
+        let (central_dir, bytes) = slice_split_at(bytes, CENTRAL_DIR_HEADER_SIZE)?;
+        let central_dir = central_dir.as_ptr() as *const raw::CentralDirectoryFileHeader;
         /* SAFETY: Again something that `bytemuck` crate would handle nicer, but in
          * the same way - we have enough bytes and they're aligned enough to be casted */
         let central_dir = unsafe { &*central_dir };
 
-        debug_assert_eq!({central_dir.signature}, CENTRAL_DIR_HEADER_SIGNATURE);
+        //debug_assert_eq!({central_dir.signature}, CENTRAL_DIR_HEADER_SIGNATURE);
 
-        let bonus_bytes_len =
-            central_dir.filename_len as usize +
-            central_dir.extra_field_len as usize +
-            central_dir.file_comment_len as usize;
-        let (bonus_bytes, bytes) = slice_split_at(bytes, bonus_bytes_len)?;
+        let mut local_file_offset = central_dir.local_file_header_offset as usize;
+        let mut compressed_size = central_dir.compressed_size as usize;
+        let mut decompressed_size = central_dir.decompressed_size as usize;
+        let filename_len = central_dir.filename_len as usize;
+        let extra_fields_len = central_dir.extra_field_len as usize;
+        let file_comment_len = central_dir.file_comment_len as usize;
 
-        self.data = bytes;
+        let (filename, bytes) = slice_split_at(bytes, filename_len)?;
+        let (extra_fields, bytes) = slice_split_at(bytes, extra_fields_len)?; // TODO: parse extra fields
+        let (comment, _bytes) = slice_split_at(bytes, file_comment_len)?;
 
-        return Some((central_dir, bonus_bytes));
+        let mut extra_iter = extra::Iter { data: extra_fields };
+        if let Some(zip64) = extra_iter
+            .find(|(signature, _)| *signature == extra::Zip64::SIGNATURE)
+            .and_then(|(_, data)| extra::Zip64::parse(data))
+        {
+            compressed_size = zip64.compressed_size as usize;
+            decompressed_size = zip64.decompressed_size as usize;
+            local_file_offset = zip64.local_header_record_offset as usize;
+        }
+
+        let total_bytes_len =
+            CENTRAL_DIR_HEADER_SIZE +
+            filename_len as usize +
+            extra_fields_len as usize +
+            file_comment_len as usize;
+
+        self.offset += total_bytes_len;
+
+        let local_file_header = self.data.get(local_file_offset..)
+            .and_then(|slice| slice.get(.. mem::size_of::<raw::LocalFileHeader>()))?;
+        let local_file_header = local_file_header.as_ptr() as *const raw::LocalFileHeader;
+        /* SAFETY: Again something that `bytemuck` crate would handle nicer, but in
+         * the same way - we have enough bytes and they're aligned enough to be casted */
+        let local_file_header = unsafe { &*local_file_header };
+        let packed_file_offset = local_file_offset +
+            local_file_header.filename_len as usize +
+            local_file_header.extra_field_len as usize;
+
+        let bytes = self.data.get(packed_file_offset..)
+            .and_then(|slice| slice.get(..compressed_size))?;
+
+        let file = File {
+            compression_method: CompressionMethod::from_u16(central_dir.compression_method)?,
+            decompressed_crc: central_dir.decompressed_crc,
+            decompressed_size,
+            extra_fields,
+            filename,
+            comment,
+            bytes,
+        };
+
+        return Some(file);
     }
 }
-
